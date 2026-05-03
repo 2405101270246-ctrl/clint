@@ -17,14 +17,17 @@ PORT        = int(os.environ.get("PORT", 10000))
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"status":"ok","bot":"Lead Gen Bot"}')
     def log_message(self, *args):
-        pass   # silence access logs
+        pass
 
 
 def _run_health_server():
-    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"Health server listening on port {PORT}")
+    server.serve_forever()
 
 
 # ── Formatters ────────────────────────────────────────────
