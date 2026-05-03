@@ -2,7 +2,7 @@ import os
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
-YELP_API_KEY   = os.environ.get("YELP_API_KEY", "")
+SERP_API_KEY   = os.environ.get("SERP_API_KEY", "")
 
 # ── Region split: 90% Europe, 10% India ──────────────────
 REGIONS = {

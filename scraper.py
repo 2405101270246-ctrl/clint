@@ -1,124 +1,162 @@
-import time, random, logging
+import re, time, random, logging, os
 import requests
-from config import YELP_API_KEY
+from config import REQUEST_DELAY
 
 logger = logging.getLogger(__name__)
 
-CATEGORIES = [
-    "hair","restaurants","plumbing","electricians","cleaning",
-    "bakeries","photographers","florists","tailors","auto",
-    "drivingschools","pestcontrol","locksmiths","painters","caterers",
-    "eventplanning","landscaping","accountants","dentists","tutoring",
+SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"(\+?[\d][\d\s\-().]{7,}\d)")
+
+QUERIES_EUROPE = [
+    "salon owner contact phone no website",
+    "restaurant owner contact phone no website",
+    "plumber contact phone email",
+    "electrician contact phone email",
+    "cleaning service contact phone email",
+    "bakery contact phone email",
+    "photographer contact phone email",
+    "florist contact phone email",
+    "tailor contact phone email",
+    "mechanic contact phone email",
+    "driving school contact phone",
+    "pest control contact phone",
+    "locksmith contact phone",
+    "painter decorator contact phone",
+    "catering contact phone email",
+    "event planner contact phone email",
+    "personal trainer contact phone",
+    "accountant contact phone email",
+    "dog groomer contact phone",
+    "beauty salon contact phone email",
 ]
 
-EUROPE_LOCATIONS = [
-    "London, UK", "Manchester, UK", "Birmingham, UK",
-    "Berlin, Germany", "Munich, Germany", "Hamburg, Germany",
-    "Paris, France", "Lyon, France", "Amsterdam, Netherlands",
-    "Madrid, Spain", "Barcelona, Spain", "Rome, Italy",
-    "Milan, Italy", "Warsaw, Poland", "Brussels, Belgium",
-    "Lisbon, Portugal", "Vienna, Austria", "Dublin, Ireland",
-    "Stockholm, Sweden", "Oslo, Norway", "Copenhagen, Denmark",
-    "Zurich, Switzerland", "Prague, Czech Republic",
+QUERIES_INDIA = [
+    "salon owner contact phone number",
+    "restaurant owner contact phone",
+    "shop owner contact phone email",
+    "coaching classes contact phone",
+    "carpenter plumber contact phone",
+    "catering service contact phone",
+    "event decorator contact phone",
+    "photographer contact phone email",
 ]
 
-INDIA_LOCATIONS = [
-    "Mumbai, India", "Delhi, India", "Bangalore, India",
-    "Hyderabad, India", "Chennai, India", "Pune, India",
+EUROPE_CITIES = [
+    "London", "Manchester", "Birmingham", "Leeds",
+    "Berlin", "Munich", "Hamburg", "Frankfurt",
+    "Paris", "Lyon", "Marseille",
+    "Amsterdam", "Rotterdam",
+    "Madrid", "Barcelona",
+    "Rome", "Milan",
+    "Warsaw", "Brussels", "Lisbon",
+    "Vienna", "Dublin", "Stockholm",
+    "Oslo", "Copenhagen", "Zurich", "Prague",
 ]
 
-
-def _region(location):
-    return "india" if "India" in location else "europe"
+INDIA_CITIES = [
+    "Mumbai", "Delhi", "Bangalore",
+    "Hyderabad", "Chennai", "Pune",
+]
 
 
 def _whatsapp(phone):
-    import re
     number = re.sub(r"[^\d]", "", phone)
     return f"https://wa.me/{number}" if number else ""
 
 
-def _fetch_yelp(category, location):
-    headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
-    params  = {
-        "term":       category,
-        "location":   location,
-        "limit":      20,
-        "sort_by":    "rating",
-    }
+def _search(query, region_key):
+    """Search via SerpApi — guaranteed results, no IP blocking."""
+    if not SERP_API_KEY:
+        logger.error("SERP_API_KEY not set!")
+        return []
+
     try:
         r = requests.get(
-            "https://api.yelp.com/v3/businesses/search",
-            headers=headers, params=params, timeout=15
+            "https://serpapi.com/search",
+            params={
+                "q":       query,
+                "api_key": SERP_API_KEY,
+                "num":     10,
+                "hl":      "en",
+                "gl":      "uk" if region_key == "europe" else "in",
+            },
+            timeout=20,
         )
-        if r.status_code == 200:
-            return r.json().get("businesses", [])
-        logger.warning(f"Yelp {r.status_code}: {category} in {location}")
+        if r.status_code != 200:
+            logger.warning(f"SerpApi {r.status_code}: {r.text[:200]}")
+            return []
+
+        data    = r.json()
+        results = data.get("organic_results", [])
+        leads   = []
+
+        for result in results:
+            snippet = result.get("snippet", "")
+            title   = result.get("title", "")
+            link    = result.get("link", "")
+
+            # Skip big directory/listing sites
+            skip = ["justdial", "indiamart", "tripadvisor", "yelp",
+                    "facebook", "instagram", "linkedin", "wikipedia",
+                    "zomato", "swiggy", "booking.com", "trustpilot"]
+            if any(s in link.lower() for s in skip):
+                continue
+
+            text   = f"{title} {snippet}"
+            phones = PHONE_RE.findall(text)
+            emails = EMAIL_RE.findall(text)
+
+            lead = {
+                "name":     title,
+                "phone":    re.sub(r"[\s\-()]", "", phones[0]) if phones else "",
+                "email":    emails[0].lower() if emails else "",
+                "address":  "",
+                "website":  link,
+                "source":   link,
+                "region":   region_key,
+                "whatsapp": _whatsapp(re.sub(r"[\s\-()]", "", phones[0])) if phones else "",
+            }
+
+            # Only keep if has phone or email
+            if lead["phone"] or lead["email"]:
+                leads.append(lead)
+
+        return leads
+
     except Exception as e:
-        logger.error(f"Yelp error: {e}")
-    return []
+        logger.error(f"SerpApi error: {e}")
+        return []
 
 
-def _to_lead(biz, location):
-    region = _region(location)
-    phone  = biz.get("phone", "") or biz.get("display_phone", "")
-    loc    = biz.get("location", {})
-    addr   = ", ".join(filter(None, [
-        loc.get("address1", ""),
-        loc.get("city", ""),
-        loc.get("country", ""),
-    ]))
-
-    # Skip if business already has a website
-    website = biz.get("url", "")  # this is yelp URL, not their own site
-    # Check if they have their own website via attributes
-    attrs = biz.get("attributes", {}) or {}
-    own_website = attrs.get("business_url", "")
-
-    from processor import generate_message
-    lead = {
-        "name":      biz.get("name", ""),
-        "phone":     phone,
-        "whatsapp":  _whatsapp(phone),
-        "email":     "",
-        "address":   addr,
-        "website":   own_website,
-        "source":    biz.get("url", ""),
-        "region":    region,
-    }
-    lead["message"] = generate_message(lead)
-    return lead
+def _build_plan():
+    plan = []
+    for city in EUROPE_CITIES:
+        for q in QUERIES_EUROPE:
+            plan.append(("europe", city, q))
+    for city in INDIA_CITIES:
+        for q in QUERIES_INDIA:
+            plan.append(("india", city, q))
+    random.shuffle(plan)
+    return plan
 
 
 def scrape_leads(stop_event):
-    # Build weighted plan: 90% Europe, 10% India
-    plan = (
-        [(loc, cat) for loc in EUROPE_LOCATIONS for cat in CATEGORIES] * 9 +
-        [(loc, cat) for loc in INDIA_LOCATIONS  for cat in CATEGORIES]
-    )
-    random.shuffle(plan)
-    seen = set()
-
-    for location, category in plan:
+    plan = _build_plan()
+    for region_key, city, query in plan:
         if stop_event.is_set():
             return
 
-        key = (location, category)
-        if key in seen:
-            continue
-        seen.add(key)
+        full_query = f"{query} {city}"
+        logger.info(f"[{region_key.upper()}] {full_query}")
 
-        logger.info(f"[{_region(location).upper()}] {category} in {location}")
-        businesses = _fetch_yelp(category, location)
-        logger.info(f"  → {len(businesses)} results from Yelp")
+        leads = _search(full_query, region_key)
+        logger.info(f"  → {len(leads)} leads found")
 
-        for biz in businesses:
+        for lead in leads:
             if stop_event.is_set():
                 return
-            # Only send leads without their own website
-            if not biz.get("attributes", {}) or True:  # include all, processor will filter
-                lead = _to_lead(biz, location)
-                if lead["name"]:
-                    yield lead
+            yield lead
 
-        time.sleep(1 + random.uniform(0.5, 1.5))
+        time.sleep(REQUEST_DELAY + random.uniform(1, 2))
