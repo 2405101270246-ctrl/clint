@@ -1,6 +1,7 @@
 import os
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.environ.get("CHAT_ID", "")  # Your Telegram chat/user ID
 
 # ── Region split: 90% Europe, 10% India ──────────────────
 REGIONS = {
