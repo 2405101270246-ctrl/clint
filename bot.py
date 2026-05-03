@@ -1,5 +1,5 @@
 import logging, threading, asyncio, os
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from config import TELEGRAM_TOKEN
@@ -11,10 +11,12 @@ logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
 PORT        = int(os.environ.get("PORT", 8443))
-WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")  # auto-set by Render
+# Set this manually in Render env vars: https://your-app-name.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
-flask_app = Flask(__name__)
-tg_app    = None   # set in main()
+flask_app  = Flask(__name__)
+tg_app     = None
+bot_loop   = None
 
 
 class BotState:
@@ -32,18 +34,17 @@ state = BotState()
 # ── Flask routes ──────────────────────────────────────────
 @flask_app.get("/")
 def health():
-    return {"status": "ok", "leads_found": state.count, "running": state.running}
+    return jsonify({"status": "ok", "leads_found": state.count, "running": state.running})
 
 
 @flask_app.post("/webhook")
 def webhook():
-    asyncio.run(_process_update(request.get_json(force=True)))
+    data = request.get_json(force=True)
+    asyncio.run_coroutine_threadsafe(
+        tg_app.process_update(Update.de_json(data, tg_app.bot)),
+        bot_loop
+    ).result(timeout=30)
     return "ok"
-
-
-async def _process_update(data: dict):
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
 
 
 # ── Keyboards ─────────────────────────────────────────────
@@ -211,14 +212,19 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"{status} | {msg}", show_alert=True)
 
 
+# ── Bot runner (runs in background thread with its own loop) ──
+def _run_bot_polling():
+    global bot_loop
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+    bot_loop.run_until_complete(tg_app.initialize())
+    bot_loop.run_until_complete(tg_app.start())
+    bot_loop.run_forever()
+
+
 # ── Entry point ───────────────────────────────────────────
-async def _setup_webhook(app):
-    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    logger.info(f"Webhook set: {WEBHOOK_URL}/webhook")
-
-
 def main():
-    global tg_app
+    global tg_app, bot_loop
     if not TELEGRAM_TOKEN:
         raise ValueError("Set TELEGRAM_TOKEN env variable!")
 
@@ -229,12 +235,22 @@ def main():
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
     if WEBHOOK_URL:
-        # Render Web Service — webhook mode
-        asyncio.run(_setup_webhook(tg_app))
-        logger.info(f"Starting web server on port {PORT}")
-        flask_app.run(host="0.0.0.0", port=PORT)
+        # ── Webhook mode (Render Web Service) ────────────
+        # Start bot event loop in background thread
+        t = threading.Thread(target=_run_bot_polling, daemon=True)
+        t.start()
+        # Wait for loop to be ready
+        import time; time.sleep(2)
+        # Register webhook with Telegram
+        asyncio.run_coroutine_threadsafe(
+            tg_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"),
+            bot_loop
+        ).result(timeout=15)
+        logger.info(f"Webhook set → {WEBHOOK_URL}/webhook")
+        logger.info(f"Starting Flask on port {PORT}")
+        flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
     else:
-        # Local — polling mode
+        # ── Polling mode (local dev) ──────────────────────
         logger.info("Starting polling (local)...")
         tg_app.run_polling()
 
