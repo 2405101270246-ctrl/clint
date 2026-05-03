@@ -5,7 +5,8 @@ SEEN = set()
 
 JUNK_NAMES  = re.compile(
     r"(advertisement|sponsored|\bad\b|google|facebook|instagram"
-    r"|justdial|indiamart|sulekha|tripadvisor|yelp|booking\.com)", re.I
+    r"|justdial|indiamart|sulekha|tripadvisor|yelp|booking\.com"
+    r"|wikipedia|linkedin|twitter|youtube)", re.I
 )
 VALID_EMAIL = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 VALID_PHONE = re.compile(r"^\+?[\d]{7,15}$")
@@ -14,7 +15,14 @@ SKIP_SOURCES = [
     "justdial", "indiamart", "sulekha", "tradeindia",
     "tripadvisor", "yelp", "booking.com", "trustpilot",
     "yellowpages", "thomsonlocal", "yell.com",
+    "wikipedia.org", "linkedin.com", "facebook.com",
 ]
+
+# These domains = business already has website — skip
+HAS_WEBSITE_DOMAINS = re.compile(
+    r"\.(com|co\.uk|de|fr|nl|es|it|pl|se|be|pt|ch|at|dk|no|fi|ie|cz|ro|hu|gr|in|net|org)\b",
+    re.I
+)
 
 
 def _clean_phone(phone: str, region_key: str) -> str:
@@ -39,17 +47,23 @@ def _dedup_key(lead: dict) -> str:
 
 
 def is_valid(lead: dict) -> bool:
-    if not lead.get("name") or len(lead["name"]) < 3:
+    name = lead.get("name", "")
+    if not name or len(name) < 3:
         return False
-    if JUNK_NAMES.search(lead.get("name", "")):
+    if JUNK_NAMES.search(name):
         return False
-    if not lead.get("phone") and not lead.get("email"):
-        return False
-    if lead.get("website"):
-        return False
+
+    # Skip known directory/listing sources
     source = lead.get("source", "")
     if any(d in source for d in SKIP_SOURCES):
         return False
+
+    # Must have at least name + one of: phone, email, address
+    has_contact = bool(lead.get("phone")) or bool(lead.get("email"))
+    has_address = bool(lead.get("address"))
+    if not has_contact and not has_address:
+        return False
+
     return True
 
 
@@ -59,11 +73,17 @@ def clean(lead: dict) -> dict:
     lead["address"] = lead.get("address", "").strip()
 
     phone = _clean_phone(lead.get("phone", ""), region_key)
-    lead["phone"]     = phone if VALID_PHONE.match(phone) else ""
-    lead["whatsapp"]  = _whatsapp_link(lead["phone"]) if lead["phone"] else ""
+    lead["phone"]    = phone if VALID_PHONE.match(phone) else ""
+    lead["whatsapp"] = _whatsapp_link(lead["phone"]) if lead["phone"] else ""
 
     email = lead.get("email", "").strip().lower()
     lead["email"] = email if VALID_EMAIL.match(email) else ""
+
+    # Clear website field — we want businesses WITHOUT websites
+    # Only set if it's clearly a dedicated business website (not a directory)
+    website = lead.get("website", "")
+    if website and any(d in website for d in SKIP_SOURCES):
+        lead["website"] = ""
 
     return lead
 
@@ -87,12 +107,11 @@ def generate_message(lead: dict) -> str:
             f"Main aapke liye ek professional website + app bana sakta hoon "
             f"jisse zyada customers milenge. Free demo dekhna chahenge? 😊"
         )
-    else:
-        return (
-            f"Hi {name}! 👋 I noticed your business doesn't have a website yet.\n"
-            f"I build professional websites & apps that bring in more customers — "
-            f"quick, affordable & tailored for you. Want a free demo? 😊"
-        )
+    return (
+        f"Hi {name}! 👋 I noticed your business doesn't have a website yet.\n"
+        f"I build professional websites & apps that bring in more customers — "
+        f"quick, affordable & tailored for you. Want a free demo? 😊"
+    )
 
 
 def process(lead: dict):
