@@ -6,7 +6,7 @@ from config import TELEGRAM_TOKEN, CHAT_ID
 from scraper import scrape_leads
 from processor import process
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
@@ -67,14 +67,17 @@ def _scrape_worker(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
     while True:
         logger.info("Scrape cycle starting...")
         found = 0
+        raw_count = 0
         for raw_lead in scrape_leads(stop):
+            raw_count += 1
             lead = process(raw_lead)
             if not lead:
+                logger.debug(f"Filtered out: {raw_lead.get('name')} | phone={raw_lead.get('phone')} email={raw_lead.get('email')} website={raw_lead.get('website')}")
                 continue
             asyncio.run_coroutine_threadsafe(queue.put(lead), loop)
             found += 1
-            time.sleep(1)   # extra delay between leads to avoid 429
-        logger.info(f"Cycle done — {found} leads. Sleeping 120s.")
+            time.sleep(1)
+        logger.info(f"Cycle done — raw={raw_count} passed={found}. Sleeping 120s.")
         time.sleep(120)
 
 
