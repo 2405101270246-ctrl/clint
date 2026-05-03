@@ -2,7 +2,7 @@ import logging, asyncio, os, time, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Bot
 from telegram.error import RetryAfter, TimedOut
-from config import TELEGRAM_TOKEN, CHAT_ID
+from config import TELEGRAM_TOKEN, CHAT_ID as CONFIG_CHAT_ID
 from scraper import scrape_leads
 from processor import process
 
@@ -83,11 +83,32 @@ def _scrape_worker(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
 
 # ── Main async loop ───────────────────────────────────────
 async def run():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.error("TELEGRAM_TOKEN or CHAT_ID not set!")
+    chat_id = CONFIG_CHAT_ID
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN not set! Please set it in config.py or environment.")
         return
 
     bot   = Bot(token=TELEGRAM_TOKEN)
+
+    # ── Auto-Detect CHAT_ID ──
+    if not chat_id:
+        logger.info("⚠️ CHAT_ID is missing!")
+        logger.info("👉 Please open Telegram and send /start to your bot right now...")
+        offset = None
+        while not chat_id:
+            try:
+                updates = await bot.get_updates(offset=offset, timeout=10)
+                for update in updates:
+                    offset = update.update_id + 1
+                    if update.message and update.message.chat:
+                        chat_id = str(update.message.chat.id)
+                        logger.info(f"✅ Automatically detected CHAT_ID: {chat_id}")
+                        break
+            except Exception:
+                pass
+            if not chat_id:
+                await asyncio.sleep(2)
+
     queue = asyncio.Queue()
     loop  = asyncio.get_running_loop()
     count = 0
@@ -99,20 +120,20 @@ async def run():
 
     try:
         await bot.send_message(
-            chat_id=CHAT_ID,
+            chat_id=chat_id,
             text="🚀 *Bot started\\! Searching for leads\\.\\.\\.*",
             parse_mode="MarkdownV2",
         )
         logger.info("Startup message sent to Telegram")
     except Exception as e:
         logger.error(f"Startup message failed: {e}")
-        logger.error("Check CHAT_ID — must be your personal numeric ID from @userinfobot")
+        logger.error("Check your CHAT_ID or interact with the bot first.")
 
     while True:
         lead = await queue.get()
         try:
             await bot.send_message(
-                chat_id=CHAT_ID,
+                chat_id=chat_id,
                 text=_format_lead(lead),
                 parse_mode="MarkdownV2",
                 disable_web_page_preview=True,

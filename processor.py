@@ -58,6 +58,11 @@ def is_valid(lead: dict) -> bool:
     if any(d in source for d in SKIP_SOURCES):
         return False
 
+    # Skip businesses that already have their own website
+    website = lead.get("website", "")
+    if website and HAS_WEBSITE_DOMAINS.search(website) and not any(d in website for d in SKIP_SOURCES):
+        return False
+
     # Must have at least name + one of: phone, email, address
     has_contact = bool(lead.get("phone")) or bool(lead.get("email"))
     has_address = bool(lead.get("address"))
