@@ -1,4 +1,5 @@
 import logging, asyncio, os, time, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Bot
 from telegram.error import RetryAfter, TimedOut
 from config import TELEGRAM_TOKEN, CHAT_ID
@@ -9,8 +10,24 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
+PORT        = int(os.environ.get("PORT", 10000))
 
 
+# ── Minimal HTTP server — satisfies Render port check ─────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"status":"ok","bot":"Lead Gen Bot"}')
+    def log_message(self, *args):
+        pass   # silence access logs
+
+
+def _run_health_server():
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
+
+
+# ── Formatters ────────────────────────────────────────────
 def _esc(text: str) -> str:
     for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
@@ -41,9 +58,9 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Scraper thread ────────────────────────────────────────
 def _scrape_worker(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
-    """Runs in a background thread — pushes leads into async queue."""
-    stop = threading.Event()   # never set — runs forever
+    stop = threading.Event()
     while True:
         logger.info("Scrape cycle starting...")
         found = 0
@@ -53,13 +70,15 @@ def _scrape_worker(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
                 continue
             asyncio.run_coroutine_threadsafe(queue.put(lead), loop)
             found += 1
-        logger.info(f"Scrape cycle done — {found} leads queued. Sleeping 60s.")
-        time.sleep(60)
+            time.sleep(1)   # extra delay between leads to avoid 429
+        logger.info(f"Cycle done — {found} leads. Sleeping 120s.")
+        time.sleep(120)
 
 
+# ── Main async loop ───────────────────────────────────────
 async def run():
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.error("TELEGRAM_TOKEN or CHAT_ID not set in environment!")
+        logger.error("TELEGRAM_TOKEN or CHAT_ID not set!")
         return
 
     bot   = Bot(token=TELEGRAM_TOKEN)
@@ -67,22 +86,22 @@ async def run():
     loop  = asyncio.get_running_loop()
     count = 0
 
-    # Start scraper in background thread
-    t = threading.Thread(target=_scrape_worker, args=(queue, loop), daemon=True)
-    t.start()
-    logger.info("Scraper thread started")
+    # Start health server + scraper thread
+    threading.Thread(target=_run_health_server, daemon=True).start()
+    threading.Thread(target=_scrape_worker, args=(queue, loop), daemon=True).start()
+    logger.info(f"Health server on port {PORT} | Scraper started")
 
-    # Send startup message
     try:
         await bot.send_message(
             chat_id=CHAT_ID,
             text="🚀 *Bot started\\! Searching for leads\\.\\.\\.*",
             parse_mode="MarkdownV2",
         )
+        logger.info("Startup message sent to Telegram")
     except Exception as e:
         logger.error(f"Startup message failed: {e}")
+        logger.error("Check CHAT_ID — must be your personal numeric ID from @userinfobot")
 
-    # Main loop — consume leads from queue and send to Telegram
     while True:
         lead = await queue.get()
         try:
@@ -97,9 +116,8 @@ async def run():
         except RetryAfter as e:
             logger.warning(f"Rate limited — sleeping {e.retry_after}s")
             await asyncio.sleep(e.retry_after)
-            await queue.put(lead)   # re-queue
+            await queue.put(lead)
         except TimedOut:
-            logger.warning("Timed out — retrying in 5s")
             await asyncio.sleep(5)
             await queue.put(lead)
         except Exception as e:

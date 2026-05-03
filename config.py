@@ -95,8 +95,8 @@ REGIONS = {
     },
 }
 
-MAX_RESULTS_PER_QUERY = 5
-REQUEST_DELAY         = 4    # seconds — increase to 6-8 if Google blocks
+MAX_RESULTS_PER_QUERY = 3
+REQUEST_DELAY         = 8    # increased to avoid Google 429 blocks
 MAX_RETRIES           = 3
 
 # Rotate user agents to reduce blocking
