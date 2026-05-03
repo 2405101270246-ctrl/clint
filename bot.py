@@ -1,6 +1,6 @@
 import logging, threading, asyncio, os, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from config import TELEGRAM_TOKEN
 from scraper import scrape_leads
 from processor import process
@@ -20,7 +20,7 @@ class BotState:
         self.running    = False
         self.count      = 0
         self.status_msg = "Idle"
-        self.main_loop  = None   # main asyncio loop reference
+        self.main_loop  = None
 
 
 state = BotState()
@@ -70,23 +70,22 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Worker — runs in thread, posts back via main loop ─────
+# ── Worker thread ─────────────────────────────────────────
 def _run_workflow(chat_id, bot):
     def send_sync(text, keyboard=None):
-        if state.main_loop is None:
+        if not state.main_loop:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="MarkdownV2",
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            ),
-            state.main_loop,
-        )
         try:
-            future.result(timeout=20)
+            asyncio.run_coroutine_threadsafe(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="MarkdownV2",
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                ),
+                state.main_loop,
+            ).result(timeout=20)
         except Exception as e:
             logger.error(f"Send error: {e}")
 
@@ -195,28 +194,29 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ── post_init — capture event loop after app starts ───────
+async def post_init(app: Application):
+    state.main_loop = asyncio.get_running_loop()
+    logger.info(f"main_loop captured: {state.main_loop}")
+
+
 # ── Entry point ───────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("Set TELEGRAM_TOKEN env variable!")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     if WEBHOOK_URL:
         logger.info(f"Webhook mode → {WEBHOOK_URL}/webhook  port={PORT}")
-
-        async def post_init(application):
-            state.main_loop = asyncio.get_event_loop()
-            await application.bot.set_webhook(
-                url=f"{WEBHOOK_URL}/webhook",
-                drop_pending_updates=True,
-            )
-            logger.info("Webhook registered with Telegram ✓")
-
-        app.post_init = post_init
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -226,11 +226,6 @@ def main():
         )
     else:
         logger.info("Polling mode (local)...")
-
-        async def post_init(application):
-            state.main_loop = asyncio.get_event_loop()
-
-        app.post_init = post_init
         app.run_polling(drop_pending_updates=True)
 
 
