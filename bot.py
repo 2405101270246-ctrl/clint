@@ -41,6 +41,10 @@ def _format_lead(lead: dict) -> str:
 
 
 async def run():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("TELEGRAM_TOKEN or CHAT_ID env variable not set!")
+        return
+
     bot   = Bot(token=TELEGRAM_TOKEN)
     stop  = asyncio.Event()   # never set — runs forever
     count = 0
