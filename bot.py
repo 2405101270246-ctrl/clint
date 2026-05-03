@@ -1,4 +1,5 @@
-import logging, threading, asyncio
+import logging, threading, asyncio, os
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from config import TELEGRAM_TOKEN
@@ -9,6 +10,11 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
+PORT        = int(os.environ.get("PORT", 8443))
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")  # auto-set by Render
+
+flask_app = Flask(__name__)
+tg_app    = None   # set in main()
 
 
 class BotState:
@@ -23,23 +29,38 @@ class BotState:
 state = BotState()
 
 
+# ── Flask routes ──────────────────────────────────────────
+@flask_app.get("/")
+def health():
+    return {"status": "ok", "leads_found": state.count, "running": state.running}
+
+
+@flask_app.post("/webhook")
+def webhook():
+    asyncio.run(_process_update(request.get_json(force=True)))
+    return "ok"
+
+
+async def _process_update(data: dict):
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+
+
 # ── Keyboards ─────────────────────────────────────────────
 def control_keyboard(running: bool):
     if running:
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("⏹ STOP", callback_data="stop"),
+            InlineKeyboardButton("⏹ STOP",    callback_data="stop"),
             InlineKeyboardButton("📊 Status", callback_data="status"),
         ]])
-    else:
-        return InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶ START", callback_data="start"),
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-        ]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶ START",   callback_data="start"),
+        InlineKeyboardButton("📊 Status", callback_data="status"),
+    ]])
 
 
 # ── Formatters ────────────────────────────────────────────
 def _esc(text: str) -> str:
-    """Escape MarkdownV2 special chars."""
     for ch in r"\_*[]()~`>#+-=|{}.!":
         text = text.replace(ch, f"\\{ch}")
     return text
@@ -53,9 +74,7 @@ def _format_lead(lead: dict) -> str:
     source  = lead.get("source") or ""
     wa      = lead.get("whatsapp") or ""
     msg     = _esc(lead.get("message") or "")
-    region  = lead.get("region", "europe")
-    flag    = REGION_FLAG.get(region, "🌍")
-
+    flag    = REGION_FLAG.get(lead.get("region", "europe"), "🌍")
     contact = phone if phone else email if email else "N/A"
 
     lines = [
@@ -67,11 +86,7 @@ def _format_lead(lead: dict) -> str:
         lines.append(f"💬 *WhatsApp:* [Click to Chat]({wa})")
     if source:
         lines.append(f"🔗 *Source:* [Link]({_esc(source)})")
-    lines += [
-        "",
-        f"✉️ *Ready\\-to\\-send:*",
-        f"```\n{msg}\n```",
-    ]
+    lines += ["", "✉️ *Ready\\-to\\-send:*", f"```\n{msg}\n```"]
     return "\n".join(lines)
 
 
@@ -106,9 +121,7 @@ def _run_workflow(chat_id, bot):
         lead = process(raw_lead)
         if not lead:
             continue
-
         loop.run_until_complete(send(_format_lead(lead)))
-
         with state.lock:
             state.count += 1
             state.status_msg = f"✅ Running — {state.count} leads found"
@@ -128,7 +141,7 @@ def _run_workflow(chat_id, bot):
     loop.close()
 
 
-# ── Handlers ──────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Lead Gen Bot*\n\n"
@@ -152,7 +165,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with state.lock:
-        msg = state.status_msg
+        msg     = state.status_msg
         running = state.running
     status = "🟢 Running" if running else "🔴 Idle"
     await update.message.reply_text(
@@ -174,13 +187,11 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             state.running = True
             state.stop_event.clear()
-
         threading.Thread(
             target=_run_workflow,
             args=(chat_id, ctx.application.bot),
             daemon=True
         ).start()
-
         await query.edit_message_reply_markup(reply_markup=control_keyboard(running=True))
 
     elif query.data == "stop":
@@ -201,16 +212,31 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── Entry point ───────────────────────────────────────────
+async def _setup_webhook(app):
+    await app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    logger.info(f"Webhook set: {WEBHOOK_URL}/webhook")
+
+
 def main():
+    global tg_app
     if not TELEGRAM_TOKEN:
         raise ValueError("Set TELEGRAM_TOKEN env variable!")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot running…")
-    app.run_polling()
+
+    tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    tg_app.add_handler(CommandHandler("start",  cmd_start))
+    tg_app.add_handler(CommandHandler("help",   cmd_help))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CallbackQueryHandler(button_handler))
+
+    if WEBHOOK_URL:
+        # Render Web Service — webhook mode
+        asyncio.run(_setup_webhook(tg_app))
+        logger.info(f"Starting web server on port {PORT}")
+        flask_app.run(host="0.0.0.0", port=PORT)
+    else:
+        # Local — polling mode
+        logger.info("Starting polling (local)...")
+        tg_app.run_polling()
 
 
 if __name__ == "__main__":
