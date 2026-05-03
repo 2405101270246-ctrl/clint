@@ -1,5 +1,4 @@
 import logging, threading, asyncio, os, time
-from flask import Flask, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from config import TELEGRAM_TOKEN
@@ -11,8 +10,7 @@ logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
 PORT        = int(os.environ.get("PORT", 10000))
-
-flask_app = Flask(__name__)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
 
 class BotState:
@@ -22,24 +20,10 @@ class BotState:
         self.running    = False
         self.count      = 0
         self.status_msg = "Idle"
+        self.main_loop  = None   # main asyncio loop reference
 
 
 state = BotState()
-
-
-# ── Flask — keeps Render Web Service alive ────────────────
-@flask_app.get("/")
-def health():
-    return jsonify({
-        "status":      "ok",
-        "bot":         "Lead Gen Bot",
-        "running":     state.running,
-        "leads_found": state.count,
-    })
-
-
-def _run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
 
 
 # ── Keyboards ─────────────────────────────────────────────
@@ -86,19 +70,23 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Continuous worker ─────────────────────────────────────
+# ── Worker — runs in thread, posts back via main loop ─────
 def _run_workflow(chat_id, bot):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def send(text, keyboard=None):
-        try:
-            await bot.send_message(
-                chat_id=chat_id, text=text,
+    def send_sync(text, keyboard=None):
+        if state.main_loop is None:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                chat_id=chat_id,
+                text=text,
                 parse_mode="MarkdownV2",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
-            )
+            ),
+            state.main_loop,
+        )
+        try:
+            future.result(timeout=20)
         except Exception as e:
             logger.error(f"Send error: {e}")
 
@@ -106,31 +94,29 @@ def _run_workflow(chat_id, bot):
         state.count      = 0
         state.status_msg = "Searching..."
 
-    loop.run_until_complete(send(
+    send_sync(
         "🚀 *Lead search started\\!*\n"
         "_Scanning Europe \\(90%\\) \\+ India \\(10%\\)_\n"
         "_Leads arrive one by one\\. Press ⏹ STOP anytime\\._",
-        control_keyboard(running=True)
-    ))
+        control_keyboard(running=True),
+    )
 
     while not state.stop_event.is_set():
         found_any = False
-
         for raw_lead in scrape_leads(state.stop_event):
             if state.stop_event.is_set():
                 break
             lead = process(raw_lead)
             if not lead:
                 continue
-            loop.run_until_complete(send(_format_lead(lead)))
+            send_sync(_format_lead(lead))
             found_any = True
             with state.lock:
                 state.count += 1
                 state.status_msg = f"Running — {state.count} leads sent"
 
         if not state.stop_event.is_set():
-            msg = "⏳ *Cycle complete\\. Restarting in 60s\\.*" if found_any else "⏳ *No new leads\\. Retrying in 60s\\.*"
-            loop.run_until_complete(send(msg))
+            send_sync("⏳ *Cycle done\\. Restarting in 60s\\.*")
             time.sleep(60)
 
     with state.lock:
@@ -138,14 +124,13 @@ def _run_workflow(chat_id, bot):
         state.running    = False
         state.status_msg = f"Stopped — {final} leads total"
 
-    loop.run_until_complete(send(
+    send_sync(
         f"⏹ *Stopped\\.* Total leads sent: *{final}*",
-        control_keyboard(running=False)
-    ))
-    loop.close()
+        control_keyboard(running=False),
+    )
 
 
-# ── Handlers ─────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Lead Gen Bot*\n\n"
@@ -183,7 +168,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         threading.Thread(
             target=_run_workflow,
             args=(chat_id, ctx.application.bot),
-            daemon=True
+            daemon=True,
         ).start()
         await query.edit_message_reply_markup(reply_markup=control_keyboard(running=True))
 
@@ -206,7 +191,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             running = state.running
         await query.answer(
             f"{'🟢 Running' if running else '🔴 Idle'} | {msg}",
-            show_alert=True
+            show_alert=True,
         )
 
 
@@ -215,19 +200,38 @@ def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("Set TELEGRAM_TOKEN env variable!")
 
-    # Flask in background thread — keeps Render Web Service alive
-    threading.Thread(target=_run_flask, daemon=True).start()
-    logger.info(f"Flask started on port {PORT}")
-
-    # Build telegram app
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Delete any old webhook — use polling
-    logger.info("Starting polling...")
-    app.run_polling(drop_pending_updates=True)
+    if WEBHOOK_URL:
+        logger.info(f"Webhook mode → {WEBHOOK_URL}/webhook  port={PORT}")
+
+        async def post_init(application):
+            state.main_loop = asyncio.get_event_loop()
+            await application.bot.set_webhook(
+                url=f"{WEBHOOK_URL}/webhook",
+                drop_pending_updates=True,
+            )
+            logger.info("Webhook registered with Telegram ✓")
+
+        app.post_init = post_init
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="webhook",
+            webhook_url=f"{WEBHOOK_URL}/webhook",
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("Polling mode (local)...")
+
+        async def post_init(application):
+            state.main_loop = asyncio.get_event_loop()
+
+        app.post_init = post_init
+        app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
