@@ -1,4 +1,4 @@
-import logging, threading, asyncio, os
+import logging, threading, asyncio, os, time
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -10,22 +10,21 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 logger = logging.getLogger(__name__)
 
 REGION_FLAG = {"europe": "🇪🇺", "india": "🇮🇳"}
-PORT        = int(os.environ.get("PORT", 8443))
-# Set this manually in Render env vars: https://your-app-name.onrender.com
+PORT        = int(os.environ.get("PORT", 10000))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 
-flask_app  = Flask(__name__)
-tg_app     = None
-bot_loop   = None
+flask_app = Flask(__name__)
+tg_app    = None
+bot_loop  = None
 
 
 class BotState:
     def __init__(self):
-        self.stop_event  = threading.Event()
-        self.lock        = threading.Lock()
-        self.running     = False
-        self.count       = 0
-        self.status_msg  = "Idle"
+        self.stop_event = threading.Event()
+        self.lock       = threading.Lock()
+        self.running    = False
+        self.count      = 0
+        self.status_msg = "Idle"
 
 
 state = BotState()
@@ -34,17 +33,19 @@ state = BotState()
 # ── Flask routes ──────────────────────────────────────────
 @flask_app.get("/")
 def health():
-    return jsonify({"status": "ok", "leads_found": state.count, "running": state.running})
+    return jsonify({"status": "ok", "bot": "Lead Gen Bot", "leads_found": state.count, "running": state.running})
 
 
 @flask_app.post("/webhook")
 def webhook():
-    data = request.get_json(force=True)
-    asyncio.run_coroutine_threadsafe(
-        tg_app.process_update(Update.de_json(data, tg_app.bot)),
-        bot_loop
-    ).result(timeout=30)
-    return "ok"
+    try:
+        data   = request.get_json(force=True)
+        update = Update.de_json(data, tg_app.bot)
+        future = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), bot_loop)
+        future.result(timeout=30)
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    return "ok", 200
 
 
 # ── Keyboards ─────────────────────────────────────────────
@@ -91,19 +92,24 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Worker thread ─────────────────────────────────────────
+# ── Continuous worker — runs until STOP ───────────────────
 def _run_workflow(chat_id, bot):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    """Continuously scrapes leads and sends them one by one until stop_event is set."""
 
-    async def send(text, keyboard=None):
-        try:
-            await bot.send_message(
-                chat_id=chat_id, text=text,
+    def send_sync(text, keyboard=None):
+        """Send message from worker thread using bot_loop."""
+        future = asyncio.run_coroutine_threadsafe(
+            bot.send_message(
+                chat_id=chat_id,
+                text=text,
                 parse_mode="MarkdownV2",
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
-            )
+            ),
+            bot_loop
+        )
+        try:
+            future.result(timeout=15)
         except Exception as e:
             logger.error(f"Send error: {e}")
 
@@ -111,35 +117,48 @@ def _run_workflow(chat_id, bot):
         state.count      = 0
         state.status_msg = "🔍 Searching..."
 
-    loop.run_until_complete(send(
-        "🚀 *Lead search started\\!*\n_Scanning Europe \\(90%\\) \\+ India \\(10%\\)\\.\\.\\._",
+    send_sync(
+        "🚀 *Lead search started\\!*\n"
+        "_Scanning Europe \\(90%\\) \\+ India \\(10%\\)_\n"
+        "_Leads will arrive one by one\\. Press ⏹ STOP to stop\\._",
         control_keyboard(running=True)
-    ))
+    )
 
-    for raw_lead in scrape_leads(state.stop_event):
-        if state.stop_event.is_set():
-            break
-        lead = process(raw_lead)
-        if not lead:
-            continue
-        loop.run_until_complete(send(_format_lead(lead)))
-        with state.lock:
-            state.count += 1
-            state.status_msg = f"✅ Running — {state.count} leads found"
+    # ── Continuous loop — restart scraper when exhausted ──
+    while not state.stop_event.is_set():
+        found_any = False
 
+        for raw_lead in scrape_leads(state.stop_event):
+            if state.stop_event.is_set():
+                break
+
+            lead = process(raw_lead)
+            if not lead:
+                continue
+
+            send_sync(_format_lead(lead))
+            found_any = True
+
+            with state.lock:
+                state.count += 1
+                state.status_msg = f"✅ Running — {state.count} leads sent"
+
+        # If scraper exhausted all queries without STOP, wait then restart
+        if not state.stop_event.is_set():
+            if not found_any:
+                send_sync("⏳ *All queries done\\. Waiting 60s before next cycle\\.*")
+            time.sleep(60)
+
+    # ── STOP was pressed ──────────────────────────────────
     with state.lock:
         final_count      = state.count
         state.running    = False
-        state.status_msg = f"✅ Done — {final_count} leads total"
+        state.status_msg = f"Stopped — {final_count} leads total"
 
-    stopped = state.stop_event.is_set()
-    summary = (
-        f"⏹ *Stopped\\.* Found *{final_count}* leads so far\\."
-        if stopped else
-        f"✅ *All done\\!* Found *{final_count}* leads\\."
+    send_sync(
+        f"⏹ *Stopped\\.* Total leads sent: *{final_count}*",
+        control_keyboard(running=False)
     )
-    loop.run_until_complete(send(summary, control_keyboard(running=False)))
-    loop.close()
 
 
 # ── Telegram handlers ─────────────────────────────────────
@@ -148,19 +167,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 *Lead Gen Bot*\n\n"
         "Finds local businesses *without a website or app*\\.\n"
         "🇪🇺 90% Europe \\| 🇮🇳 10% India\n\n"
+        "_Leads arrive one by one\\. Bot keeps searching until you press STOP\\._\n\n"
         "Press *▶ START* to begin\\.",
         parse_mode="MarkdownV2",
         reply_markup=control_keyboard(running=state.running),
-    )
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Commands:*\n"
-        "/start \\— Show control panel\n"
-        "/status \\— Current run status\n"
-        "/help \\— This message",
-        parse_mode="MarkdownV2",
     )
 
 
@@ -176,6 +186,16 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Commands:*\n"
+        "/start \\— Control panel\n"
+        "/status \\— Live status\n"
+        "/help \\— This message",
+        parse_mode="MarkdownV2",
+    )
+
+
 async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -188,6 +208,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return
             state.running = True
             state.stop_event.clear()
+
         threading.Thread(
             target=_run_workflow,
             args=(chat_id, ctx.application.bot),
@@ -196,11 +217,15 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=control_keyboard(running=True))
 
     elif query.data == "stop":
+        with state.lock:
+            if not state.running:
+                await query.answer("Already stopped.", show_alert=True)
+                return
         state.stop_event.set()
         await query.edit_message_reply_markup(reply_markup=control_keyboard(running=False))
         await ctx.application.bot.send_message(
             chat_id=chat_id,
-            text="⏹ *Stop signal sent\\. Finishing current search\\.\\.\\.*",
+            text="⏹ *Stop signal sent\\.*",
             parse_mode="MarkdownV2",
         )
 
@@ -212,47 +237,50 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"{status} | {msg}", show_alert=True)
 
 
-# ── Bot runner (runs in background thread with its own loop) ──
-def _run_bot_polling():
+# ── Bot event loop (background thread) ───────────────────
+def _start_bot_loop():
     global bot_loop
     bot_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(bot_loop)
     bot_loop.run_until_complete(tg_app.initialize())
     bot_loop.run_until_complete(tg_app.start())
+    logger.info("Bot event loop running")
     bot_loop.run_forever()
 
 
 # ── Entry point ───────────────────────────────────────────
 def main():
-    global tg_app, bot_loop
+    global tg_app
     if not TELEGRAM_TOKEN:
         raise ValueError("Set TELEGRAM_TOKEN env variable!")
 
     tg_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     tg_app.add_handler(CommandHandler("start",  cmd_start))
-    tg_app.add_handler(CommandHandler("help",   cmd_help))
     tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("help",   cmd_help))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
+    # Start bot event loop in background thread
+    threading.Thread(target=_start_bot_loop, daemon=True).start()
+    time.sleep(2)  # wait for loop to be ready
+
     if WEBHOOK_URL:
-        # ── Webhook mode (Render Web Service) ────────────
-        # Start bot event loop in background thread
-        t = threading.Thread(target=_run_bot_polling, daemon=True)
-        t.start()
-        # Wait for loop to be ready
-        import time; time.sleep(2)
         # Register webhook with Telegram
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             tg_app.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook"),
             bot_loop
-        ).result(timeout=15)
-        logger.info(f"Webhook set → {WEBHOOK_URL}/webhook")
-        logger.info(f"Starting Flask on port {PORT}")
+        )
+        future.result(timeout=15)
+        logger.info(f"Webhook registered: {WEBHOOK_URL}/webhook")
+        logger.info(f"Flask starting on port {PORT}")
         flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
     else:
-        # ── Polling mode (local dev) ──────────────────────
-        logger.info("Starting polling (local)...")
-        tg_app.run_polling()
+        logger.info("No WEBHOOK_URL — using polling mode")
+        asyncio.run_coroutine_threadsafe(
+            tg_app.bot.delete_webhook(), bot_loop
+        ).result(timeout=10)
+        bot_loop.run_until_complete(tg_app.updater.start_polling())
+        bot_loop.run_forever()
 
 
 if __name__ == "__main__":
