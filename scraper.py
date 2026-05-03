@@ -1,131 +1,190 @@
 import re, time, random, logging
 import requests
 from bs4 import BeautifulSoup
-from config import MAX_RESULTS_PER_QUERY, REQUEST_DELAY, MAX_RETRIES, REGIONS, USER_AGENTS
+from config import REQUEST_DELAY, MAX_RETRIES, REGIONS, USER_AGENTS
 
 logger = logging.getLogger(__name__)
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"(\+?[\d][\d\s\-().]{7,}\d)")
-WEBSITE_RE = re.compile(
-    r"https?://(?!(?:www\.)?(?:google|facebook|instagram|twitter|youtube|linkedin"
-    r"|yelp|tripadvisor|justdial|indiamart|sulekha|booking|trustpilot|duckduckgo)\.)[\w.\-/]+", re.I
-)
-ADDR_RE = re.compile(
-    r"[^.]*\d[^.]*(?:road|street|nagar|colony|lane|avenue|sector|block|floor|building"
-    r"|close|drive|place|square|way|court|crescent|grove|park|gardens)[^.]*", re.I
-)
-SKIP_SOURCES = [
-    "justdial", "indiamart", "sulekha", "tradeindia",
-    "tripadvisor", "yelp", "booking.com", "trustpilot",
-    "yellowpages", "thomsonlocal", "yell.com", "duckduckgo",
+
+SEARCH_CATEGORIES = [
+    "salon", "restaurant", "plumber", "electrician", "cleaning",
+    "bakery", "driving school", "photographer", "florist", "tailor",
+    "mechanic", "dentist", "tutor", "catering", "pest control",
+    "landscaping", "locksmith", "painter", "event planner", "accountant",
+]
+
+EUROPE_CITIES = [
+    "London", "Manchester", "Birmingham",
+    "Berlin", "Munich", "Hamburg",
+    "Paris", "Lyon", "Marseille",
+    "Amsterdam", "Rotterdam",
+    "Madrid", "Barcelona",
+    "Rome", "Milan",
+    "Warsaw", "Brussels",
+    "Lisbon", "Vienna", "Dublin",
+]
+
+INDIA_CITIES = ["Mumbai", "Delhi", "Bangalore", "Hyderabad", "Chennai", "Pune"]
+
+SKIP_DOMAINS = [
+    "facebook", "instagram", "twitter", "youtube", "linkedin",
+    "tripadvisor", "yelp", "booking", "trustpilot", "justdial",
+    "indiamart", "sulekha", "zomato", "swiggy", "wikipedia",
 ]
 
 
 def _headers():
     return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
 
 def _get(url, params=None):
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.get(url, headers=_headers(), params=params, timeout=15)
-            r.raise_for_status()
-            return r
+            r = requests.get(url, headers=_headers(), params=params, timeout=20)
+            if r.status_code == 200:
+                return r
+            logger.warning(f"HTTP {r.status_code} for {url}")
+            time.sleep(REQUEST_DELAY * (attempt + 1))
         except Exception as e:
             logger.warning(f"Attempt {attempt+1} failed: {e}")
             time.sleep(REQUEST_DELAY * (attempt + 1))
     return None
 
 
-def _parse_result(result_div, region_key):
-    lead = {
-        "name": "", "phone": "", "email": "", "address": "",
-        "website": "", "source": "", "region": region_key,
-    }
-
-    # DuckDuckGo result title
-    title_tag = result_div.find("a", class_="result__a") or result_div.find("h2")
-    if title_tag:
-        lead["name"] = title_tag.get_text(strip=True)
-        href = title_tag.get("href", "")
-        if href and not href.startswith("//duckduckgo"):
-            lead["source"] = href
-
-    full_text = result_div.get_text(" ", strip=True)
-
-    emails = EMAIL_RE.findall(full_text)
-    if emails:
-        lead["email"] = emails[0].lower()
-
-    phones = PHONE_RE.findall(full_text)
-    if phones:
-        lead["phone"] = re.sub(r"[\s\-()]", "", phones[0])
-
-    websites = WEBSITE_RE.findall(full_text)
-    if websites:
-        lead["website"] = websites[0]
-
-    addr_match = ADDR_RE.search(full_text)
-    if addr_match:
-        lead["address"] = addr_match.group(0).strip()[:150]
-
-    return lead
-
-
-def _fetch_ddg(query, region_key):
-    """Fetch results from DuckDuckGo HTML search — no API, no blocks."""
-    params = {"q": query, "kl": "wt-wt", "kp": "-2", "k1": "-1"}
-    resp = _get("https://html.duckduckgo.com/html/", params=params)
+def _scrape_yell(category, city):
+    """Scrape yell.com for UK businesses."""
+    leads = []
+    url = f"https://www.yell.com/ucs/UcsSearchAction.do"
+    params = {"keywords": category, "location": city, "pageNum": 1}
+    resp = _get(url, params=params)
     if not resp:
-        return []
+        return leads
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    results = soup.select("div.result, div.results_links")
+    for card in soup.select("article.businessCapsule"):
+        lead = {"name": "", "phone": "", "email": "", "address": "", "website": "", "source": "", "region": "europe"}
+        name_tag = card.select_one("h2.businessCapsule--name a, .businessCapsule--name")
+        if name_tag:
+            lead["name"] = name_tag.get_text(strip=True)
+        phone_tag = card.select_one("[class*='phone'], [itemprop='telephone']")
+        if phone_tag:
+            lead["phone"] = phone_tag.get_text(strip=True)
+        addr_tag = card.select_one("[itemprop='address'], .businessCapsule--address")
+        if addr_tag:
+            lead["address"] = addr_tag.get_text(" ", strip=True)[:150]
+        link_tag = card.select_one("a[href]")
+        if link_tag:
+            lead["source"] = "https://www.yell.com" + link_tag.get("href", "")
+        if lead["name"]:
+            leads.append(lead)
+    return leads
+
+
+def _scrape_hotfrog(category, city, region_key):
+    """Scrape hotfrog.com — works globally."""
     leads = []
-    for r in results:
-        lead = _parse_result(r, region_key)
+    url = f"https://www.hotfrog.com/search/{city.lower().replace(' ', '-')}/{category.lower().replace(' ', '-')}"
+    resp = _get(url)
+    if not resp:
+        return leads
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for card in soup.select("div.search-result, div.business-card, article"):
+        lead = {"name": "", "phone": "", "email": "", "address": "", "website": "", "source": url, "region": region_key}
+        name_tag = card.select_one("h2 a, h3 a, .business-name a, .name")
+        if name_tag:
+            lead["name"] = name_tag.get_text(strip=True)
+        text = card.get_text(" ", strip=True)
+        phones = PHONE_RE.findall(text)
+        if phones:
+            lead["phone"] = re.sub(r"[\s\-()]", "", phones[0])
+        emails = EMAIL_RE.findall(text)
+        if emails:
+            lead["email"] = emails[0].lower()
         if lead["name"] and len(lead["name"]) > 3:
-            # Skip directory sites
-            if not any(d in lead.get("source", "") for d in SKIP_SOURCES):
-                leads.append(lead)
+            leads.append(lead)
+    return leads
+
+
+def _scrape_cylex(category, city, region_key):
+    """Scrape cylex-uk.co.uk or cylex.de — free business directory."""
+    leads = []
+    if region_key == "europe" and city in ["London", "Manchester", "Birmingham", "Dublin"]:
+        base = "https://www.cylex-uk.co.uk"
+        url  = f"{base}/companies/{category.replace(' ', '-')}_{city.replace(' ', '-')}.html"
+    elif region_key == "europe" and city in ["Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne"]:
+        base = "https://www.cylex.de"
+        url  = f"{base}/firmen/{category.replace(' ', '-')}_{city.replace(' ', '-')}.html"
+    else:
+        return leads
+
+    resp = _get(url)
+    if not resp:
+        return leads
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for card in soup.select("div.company-info, div.result-item, li.result"):
+        lead = {"name": "", "phone": "", "email": "", "address": "", "website": "", "source": url, "region": region_key}
+        name_tag = card.select_one("h2 a, h3 a, .company-name, .name")
+        if name_tag:
+            lead["name"] = name_tag.get_text(strip=True)
+        text = card.get_text(" ", strip=True)
+        phones = PHONE_RE.findall(text)
+        if phones:
+            lead["phone"] = re.sub(r"[\s\-()]", "", phones[0])
+        addr_tag = card.select_one("[itemprop='address'], .address")
+        if addr_tag:
+            lead["address"] = addr_tag.get_text(" ", strip=True)[:150]
+        if lead["name"] and len(lead["name"]) > 3:
+            leads.append(lead)
     return leads
 
 
 def _build_plan():
+    """Build weighted search plan: 90% Europe, 10% India."""
     plan = []
-    for region_key, region_data in REGIONS.items():
-        weight = region_data["weight"]
-        combos = [
-            (region_key, loc, q)
-            for loc in region_data["locations"]
-            for q in region_data["queries"]
-        ]
-        plan.extend(combos * weight)
+    for cat in SEARCH_CATEGORIES:
+        for city in EUROPE_CITIES:
+            plan.append(("europe", city, cat))
+            plan.append(("europe", city, cat))  # 2x weight
+    for cat in SEARCH_CATEGORIES:
+        for city in INDIA_CITIES:
+            plan.append(("india", city, cat))
     random.shuffle(plan)
-    # Deduplicate
-    seen, deduped = set(), []
-    for item in plan:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-    return deduped
+    return plan
 
 
 def scrape_leads(stop_event):
     plan = _build_plan()
-    for region_key, location, base_query in plan:
+    for region_key, city, category in plan:
         if stop_event.is_set():
             return
-        query = f"{base_query} {location}"
-        logger.info(f"[{region_key.upper()}] {query}")
-        leads = _fetch_ddg(query, region_key)
+
+        logger.info(f"[{region_key.upper()}] {category} in {city}")
+        leads = []
+
+        # Try multiple sources
+        if city in ["London", "Manchester", "Birmingham"]:
+            leads = _scrape_yell(category, city)
+
+        if not leads:
+            leads = _scrape_cylex(category, city, region_key)
+
+        if not leads:
+            leads = _scrape_hotfrog(category, city, region_key)
+
         for lead in leads:
             if stop_event.is_set():
                 return
             yield lead
-        time.sleep(REQUEST_DELAY + random.uniform(1, 3))
+
+        time.sleep(REQUEST_DELAY + random.uniform(1, 2))
