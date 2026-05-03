@@ -1,5 +1,6 @@
-import logging, asyncio, os, time
+import logging, asyncio, os, time, threading
 from telegram import Bot
+from telegram.error import RetryAfter, TimedOut
 from config import TELEGRAM_TOKEN, CHAT_ID
 from scraper import scrape_leads
 from processor import process
@@ -40,47 +41,69 @@ def _format_lead(lead: dict) -> str:
     return "\n".join(lines)
 
 
-async def run():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.error("TELEGRAM_TOKEN or CHAT_ID env variable not set!")
-        return
-
-    bot   = Bot(token=TELEGRAM_TOKEN)
-    stop  = asyncio.Event()   # never set — runs forever
-    count = 0
-
-    await bot.send_message(
-        chat_id=CHAT_ID,
-        text="🚀 *Bot started\\! Searching for leads\\.\\.\\.*",
-        parse_mode="MarkdownV2",
-    )
-    logger.info("Bot started — searching for leads")
-
+def _scrape_worker(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    """Runs in a background thread — pushes leads into async queue."""
+    stop = threading.Event()   # never set — runs forever
     while True:
-        found_any = False
-
+        logger.info("Scrape cycle starting...")
+        found = 0
         for raw_lead in scrape_leads(stop):
             lead = process(raw_lead)
             if not lead:
                 continue
-            try:
-                await bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=_format_lead(lead),
-                    parse_mode="MarkdownV2",
-                    disable_web_page_preview=True,
-                )
-                count += 1
-                found_any = True
-                logger.info(f"Lead #{count} sent: {lead.get('name')}")
-            except Exception as e:
-                logger.error(f"Send error: {e}")
-                await asyncio.sleep(5)
+            asyncio.run_coroutine_threadsafe(queue.put(lead), loop)
+            found += 1
+        logger.info(f"Scrape cycle done — {found} leads queued. Sleeping 60s.")
+        time.sleep(60)
 
-        # All queries done — wait then restart
-        wait = 60 if found_any else 120
-        logger.info(f"Cycle done ({count} total). Waiting {wait}s before next cycle...")
-        await asyncio.sleep(wait)
+
+async def run():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.error("TELEGRAM_TOKEN or CHAT_ID not set in environment!")
+        return
+
+    bot   = Bot(token=TELEGRAM_TOKEN)
+    queue = asyncio.Queue()
+    loop  = asyncio.get_running_loop()
+    count = 0
+
+    # Start scraper in background thread
+    t = threading.Thread(target=_scrape_worker, args=(queue, loop), daemon=True)
+    t.start()
+    logger.info("Scraper thread started")
+
+    # Send startup message
+    try:
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text="🚀 *Bot started\\! Searching for leads\\.\\.\\.*",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error(f"Startup message failed: {e}")
+
+    # Main loop — consume leads from queue and send to Telegram
+    while True:
+        lead = await queue.get()
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=_format_lead(lead),
+                parse_mode="MarkdownV2",
+                disable_web_page_preview=True,
+            )
+            count += 1
+            logger.info(f"Lead #{count} sent: {lead.get('name')}")
+        except RetryAfter as e:
+            logger.warning(f"Rate limited — sleeping {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+            await queue.put(lead)   # re-queue
+        except TimedOut:
+            logger.warning("Timed out — retrying in 5s")
+            await asyncio.sleep(5)
+            await queue.put(lead)
+        except Exception as e:
+            logger.error(f"Send error: {e}")
 
 
 if __name__ == "__main__":
